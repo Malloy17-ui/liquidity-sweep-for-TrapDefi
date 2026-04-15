@@ -1,0 +1,640 @@
+// malloy labs — liquidity sweep scalper
+// client: @TrapDefi
+// build: v2.0  (major rebuild — see changelog at bottom)
+// scope: liquidity pool detection, sweep confirmation, reclaim entry signal, regime gating
+// asset: BTC 1–3m primary
+// the operator is the variable
+
+//@version=5
+indicator("malloy — liquidity sweep v2 [TrapDefi]",
+     overlay = true,
+     max_lines_count    = 500,
+     max_labels_count   = 500,
+     max_boxes_count    = 500)
+
+// ═════════════════════════════════════════════════════════════
+// inputs — pool detection
+// ═════════════════════════════════════════════════════════════
+grpPool = "1 · pool detection"
+pivotLen     = input.int(5, "pivot lookback", minval = 2, maxval = 20, group = grpPool,
+     tooltip = "bars left/right for swing pivot confirmation. higher = cleaner pools, slower to print. 5 is the BTC 1–3m sweet spot.")
+eqTolAtrMult = input.float(0.25, "equal H/L tolerance (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = grpPool,
+     tooltip = "how close two pivots must be to count as a clustered (equal H/L) pool. only clustered pools fire sweep signals. lone pivots are tracked but stay 'cold'. 0.25 = within 0.25 × ATR(14).")
+minClusterSize = input.int(2, "min cluster size to arm pool", minval = 1, maxval = 5, group = grpPool,
+     tooltip = "how many pivots must cluster before the pool is 'armed' (eligible to fire a sweep). 2 = standard equal H/L. 3 = triple-tap, much rarer + higher quality.")
+minPoolAge   = input.int(3, "min pool age (bars)", minval = 0, maxval = 50, group = grpPool,
+     tooltip = "armed pool must be this old before a sweep counts. blocks instant-poke noise.")
+maxPoolAge   = input.int(300, "max pool lookback (bars)", minval = 20, maxval = 1000, group = grpPool,
+     tooltip = "how far back to track untouched pools. older pools drop off to keep the chart readable.")
+maxPools     = input.int(20, "max active pools per side", minval = 5, maxval = 50, group = grpPool,
+     tooltip = "hard cap on tracked pools per side (high/low). oldest drop first when exceeded. performance + visual hygiene.")
+
+// ═════════════════════════════════════════════════════════════
+// inputs — sweep quality filters
+// ═════════════════════════════════════════════════════════════
+grpSweep = "2 · sweep quality"
+minSweepDepthAtr   = input.float(0.05, "min sweep depth (× ATR)", minval = 0.0, maxval = 1.0, step = 0.01, group = grpSweep,
+     tooltip = "wick must push at least this far past the pool. filters tick-pokes. 0 disables.")
+minReclaimDepthAtr = input.float(0.05, "min reclaim depth (× ATR)", minval = 0.0, maxval = 1.0, step = 0.01, group = grpSweep,
+     tooltip = "close must come back at least this far inside the pool. filters dojis-on-the-line that aren't real reclaims.")
+useVolFilter       = input.bool(true, "require volume confirmation", group = grpSweep,
+     tooltip = "sweep bar volume must exceed N × avg volume. real sweeps have flow behind them.")
+volMult            = input.float(1.3, "volume × avg threshold", minval = 1.0, maxval = 5.0, step = 0.1, group = grpSweep)
+volLen             = input.int(20, "volume avg length", minval = 5, maxval = 100, group = grpSweep)
+
+// ═════════════════════════════════════════════════════════════
+// inputs — reclaim entry signal
+// ═════════════════════════════════════════════════════════════
+grpEntry = "3 · reclaim entry signal"
+showReclaim       = input.bool(true, "show reclaim entry triggers", group = grpEntry,
+     tooltip = "after a sweep, fires an ENTRY signal if price reclaims with momentum within N bars. this is the actionable layer.")
+reclaimWindow     = input.int(5, "reclaim window (bars after sweep)", minval = 1, maxval = 20, group = grpEntry,
+     tooltip = "how many bars after sweep we still wait for a momentum reclaim. expires after.")
+reclaimMomAtrMult = input.float(0.3, "momentum bar size (× ATR)", minval = 0.1, maxval = 2.0, step = 0.05, group = grpEntry,
+     tooltip = "the reclaim bar's range must exceed this × ATR to count as a momentum reclaim.")
+
+// ═════════════════════════════════════════════════════════════
+// inputs — regime / chop filter
+// ═════════════════════════════════════════════════════════════
+grpRegime = "4 · regime filter (chop killer)"
+useRegime          = input.bool(true, "mute signals in chop regime", group = grpRegime,
+     tooltip = "the architectural enforcement of 'skip chop sessions'. when ATR is in the bottom percentile over lookback, signals are visually grayed and alerts suppressed.")
+regimeLookback     = input.int(200, "regime lookback (bars)", minval = 50, maxval = 1000, group = grpRegime)
+regimeChopThresh   = input.float(0.30, "chop ATR percentile threshold", minval = 0.05, maxval = 0.80, step = 0.05, group = grpRegime,
+     tooltip = "if current ATR sits below this percentile of recent ATR, regime = CHOP. 0.30 = bottom 30%.")
+
+// ═════════════════════════════════════════════════════════════
+// inputs — display
+// ═════════════════════════════════════════════════════════════
+grpViz = "5 · display"
+showPoolLines = input.bool(true, "show pool lines", group = grpViz)
+showColdPools = input.bool(true, "show un-armed (cold) pools", group = grpViz,
+     tooltip = "if off, only clustered/armed pools render. cleaner chart, less context.")
+showSweepLbl  = input.bool(true, "show sweep labels", group = grpViz)
+showDashboard = input.bool(true, "show status dashboard", group = grpViz,
+     tooltip = "top-right table: nearest pool above/below, regime state, ATR. for graze-and-go reads.")
+muteHighs     = input.bool(false, "mute high-side signals", group = grpViz, tooltip = "for sessions where you only want fade-the-rip or only-longs context.")
+muteLows      = input.bool(false, "mute low-side signals",  group = grpViz)
+
+colArmedHi   = input.color(color.new(color.red,  20), "armed pool high",   group = grpViz)
+colArmedLo   = input.color(color.new(color.lime, 20), "armed pool low",    group = grpViz)
+colColdHi    = input.color(color.new(color.gray, 70), "cold pool high",    group = grpViz)
+colColdLo    = input.color(color.new(color.gray, 70), "cold pool low",     group = grpViz)
+colSweepHi   = input.color(color.new(color.red,  0),  "sweep label high",  group = grpViz)
+colSweepLo   = input.color(color.new(color.lime, 0),  "sweep label low",   group = grpViz)
+colReclaimHi = input.color(color.new(color.orange, 0), "reclaim entry SHORT", group = grpViz)
+colReclaimLo = input.color(color.new(color.aqua,   0), "reclaim entry LONG",  group = grpViz)
+colChop      = input.color(color.new(color.gray, 50),  "chop regime overlay", group = grpViz)
+lblSize      = input.string("normal", "label size", options = ["small","normal","large"], group = grpViz, tooltip = "phone users: large.")
+
+// ═════════════════════════════════════════════════════════════
+// inputs — alerts (per-type toggles)
+// ═════════════════════════════════════════════════════════════
+grpAlerts = "6 · alerts"
+alertSweepHi   = input.bool(true,  "alert: sweep HIGH",        group = grpAlerts)
+alertSweepLo   = input.bool(true,  "alert: sweep LOW",         group = grpAlerts)
+alertReclaimHi = input.bool(true,  "alert: reclaim SHORT",     group = grpAlerts)
+alertReclaimLo = input.bool(true,  "alert: reclaim LONG",      group = grpAlerts)
+alertSuppressChop = input.bool(true, "suppress alerts in CHOP regime", group = grpAlerts)
+minStarsForAlert  = input.int(1, "min quality stars for alert", minval = 1, maxval = 3, group = grpAlerts,
+     tooltip = "1 = all signals alert. 2 = only decent. 3 = only premium.")
+
+// ═════════════════════════════════════════════════════════════
+// helpers
+// ═════════════════════════════════════════════════════════════
+atr14    = ta.atr(14)
+eqTol    = eqTolAtrMult * atr14
+volAvg   = ta.sma(volume, volLen)
+lblSizeVal = lblSize == "small" ? size.small : lblSize == "large" ? size.large : size.normal
+
+// regime: percentile rank of current ATR over lookback
+atrRank      = ta.percentrank(atr14, regimeLookback) / 100.0
+isChop       = useRegime and atrRank < regimeChopThresh
+regimeStr    = isChop ? "CHOP" : "ACTIVE"
+regimeColor  = isChop ? color.new(color.gray, 0) : color.new(color.lime, 0)
+
+// ═════════════════════════════════════════════════════════════
+// pivot detection — confirms pivotLen bars after-the-fact, never repaints
+// ═════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+// ═════════════════════════════════════════════════════════════
+// pool storage
+// arrays parallel: price, bar idx, line id, armed flag, cluster size
+// ═════════════════════════════════════════════════════════════
+var array<float> poolHiPrice   = array.new<float>()
+var array<int>   poolHiBar     = array.new<int>()
+var array<line>  poolHiLine    = array.new<line>()
+var array<bool>  poolHiArmed   = array.new<bool>()
+var array<int>   poolHiCluster = array.new<int>()
+
+var array<float> poolLoPrice   = array.new<float>()
+var array<int>   poolLoBar     = array.new<int>()
+var array<line>  poolLoLine    = array.new<line>()
+var array<bool>  poolLoArmed   = array.new<bool>()
+var array<int>   poolLoCluster = array.new<int>()
+
+// pending-sweep tracking (for reclaim entry signal)
+var array<float> pendHiPrice = array.new<float>()
+var array<int>   pendHiBar   = array.new<int>()
+var array<int>   pendHiStars = array.new<int>()
+
+var array<float> pendLoPrice = array.new<float>()
+var array<int>   pendLoBar   = array.new<int>()
+var array<int>   pendLoStars = array.new<int>()
+
+// ─────────────────────────────────────────────────────────────
+// pool color resolver based on armed state
+// ─────────────────────────────────────────────────────────────
+poolColorHi(armed) => armed ? colArmedHi : colColdHi
+poolColorLo(armed) => armed ? colArmedLo : colColdLo
+poolStyleFor(armed) => armed ? line.style_solid : line.style_dotted
+poolWidthFor(armed) => armed ? 2 : 1
+
+// ─────────────────────────────────────────────────────────────
+// re-evaluate cluster status across all pools on each pivot add
+// (bounded by maxPools, so worst-case O(maxPools²) = 400 ops)
+// ─────────────────────────────────────────────────────────────
+recomputeClustersHi() =>
+    n = array.size(poolHiPrice)
+    if n > 0
+        for i = 0 to n - 1
+            cnt = 1
+            pi = array.get(poolHiPrice, i)
+            for j = 0 to n - 1
+                if i != j and math.abs(array.get(poolHiPrice, j) - pi) <= eqTol
+                    cnt += 1
+            armed = cnt >= minClusterSize
+            array.set(poolHiCluster, i, cnt)
+            wasArmed = array.get(poolHiArmed, i)
+            array.set(poolHiArmed, i, armed)
+            // re-style line if armed status changed
+            if armed != wasArmed
+                ln = array.get(poolHiLine, i)
+                if not na(ln)
+                    line.set_color(ln, poolColorHi(armed))
+                    line.set_style(ln, poolStyleFor(armed))
+                    line.set_width(ln, poolWidthFor(armed))
+
+recomputeClustersLo() =>
+    n = array.size(poolLoPrice)
+    if n > 0
+        for i = 0 to n - 1
+            cnt = 1
+            pi = array.get(poolLoPrice, i)
+            for j = 0 to n - 1
+                if i != j and math.abs(array.get(poolLoPrice, j) - pi) <= eqTol
+                    cnt += 1
+            armed = cnt >= minClusterSize
+            array.set(poolLoCluster, i, cnt)
+            wasArmed = array.get(poolLoArmed, i)
+            array.set(poolLoArmed, i, armed)
+            if armed != wasArmed
+                ln = array.get(poolLoLine, i)
+                if not na(ln)
+                    line.set_color(ln, poolColorLo(armed))
+                    line.set_style(ln, poolStyleFor(armed))
+                    line.set_width(ln, poolWidthFor(armed))
+
+// ═════════════════════════════════════════════════════════════
+// add new pivots to pools
+// ═════════════════════════════════════════════════════════════
+if not na(ph)
+    pivotBar = bar_index - pivotLen
+    ln = showPoolLines ? line.new(pivotBar, ph, bar_index, ph, color = colColdHi, style = line.style_dotted, width = 1) : na
+    array.push(poolHiPrice,   ph)
+    array.push(poolHiBar,     pivotBar)
+    array.push(poolHiLine,    ln)
+    array.push(poolHiArmed,   false)
+    array.push(poolHiCluster, 1)
+    recomputeClustersHi()
+    // hide cold pools if user chose so
+    if not showColdPools and not array.get(poolHiArmed, array.size(poolHiArmed) - 1)
+        ln2 = array.get(poolHiLine, array.size(poolHiLine) - 1)
+        if not na(ln2)
+            line.set_color(ln2, color.new(color.white, 100))
+
+if not na(pl)
+    pivotBar = bar_index - pivotLen
+    ln = showPoolLines ? line.new(pivotBar, pl, bar_index, pl, color = colColdLo, style = line.style_dotted, width = 1) : na
+    array.push(poolLoPrice,   pl)
+    array.push(poolLoBar,     pivotBar)
+    array.push(poolLoLine,    ln)
+    array.push(poolLoArmed,   false)
+    array.push(poolLoCluster, 1)
+    recomputeClustersLo()
+    if not showColdPools and not array.get(poolLoArmed, array.size(poolLoArmed) - 1)
+        ln2 = array.get(poolLoLine, array.size(poolLoLine) - 1)
+        if not na(ln2)
+            line.set_color(ln2, color.new(color.white, 100))
+
+// ═════════════════════════════════════════════════════════════
+// extend live pool lines
+// ═════════════════════════════════════════════════════════════
+if showPoolLines
+    if array.size(poolHiLine) > 0
+        for i = 0 to array.size(poolHiLine) - 1
+            ln = array.get(poolHiLine, i)
+            if not na(ln)
+                line.set_x2(ln, bar_index)
+    if array.size(poolLoLine) > 0
+        for i = 0 to array.size(poolLoLine) - 1
+            ln = array.get(poolLoLine, i)
+            if not na(ln)
+                line.set_x2(ln, bar_index)
+
+// ═════════════════════════════════════════════════════════════
+// quality scoring (1–3 stars)
+// inputs: armed cluster size, sweep depth in ATR, volume ratio, regime
+// ═════════════════════════════════════════════════════════════
+calcStars(clusterSize, depthAtr, volRatio, chop) =>
+    s = 1
+    if clusterSize >= 3
+        s += 1
+    if depthAtr >= 0.20 and volRatio >= 1.5
+        s += 1
+    chop ? math.max(1, s - 1) : s  // chop downgrades
+
+// ═════════════════════════════════════════════════════════════
+// sweep detection — confirmed bar close only
+// ═════════════════════════════════════════════════════════════
+sweptHi       = false
+sweptLo       = false
+sweptHiPrice  = 0.0
+sweptLoPrice  = 0.0
+sweptHiStars  = 0
+sweptLoStars  = 0
+sweptHiCluster = 0
+sweptLoCluster = 0
+
+if barstate.isconfirmed and not muteHighs and array.size(poolHiPrice) > 0
+    i = array.size(poolHiPrice) - 1
+    while i >= 0
+        p       = array.get(poolHiPrice, i)
+        bar     = array.get(poolHiBar,   i)
+        armed   = array.get(poolHiArmed, i)
+        cluster = array.get(poolHiCluster, i)
+        age     = bar_index - bar
+        depth   = (high - p)               // wick overshoot
+        reclaim = (p - close)              // close-back distance
+        depthAtr = atr14 > 0 ? depth / atr14 : 0
+        volRatio = volAvg > 0 ? volume / volAvg : 0
+        volPass  = not useVolFilter or volRatio >= volMult
+
+        // sweep conditions:
+        // 1. pool is armed (clustered)
+        // 2. age >= minPoolAge
+        // 3. high pierced pool by min depth
+        // 4. close came back inside by min reclaim depth
+        // 5. volume confirms
+        if armed and age >= minPoolAge and depth >= minSweepDepthAtr * atr14 and reclaim >= minReclaimDepthAtr * atr14 and volPass
+            sweptHi := true
+            sweptHiPrice := p
+            sweptHiCluster := cluster
+            sweptHiStars := calcStars(cluster, depthAtr, volRatio, isChop)
+            // queue for reclaim entry tracking
+            array.push(pendHiPrice, p)
+            array.push(pendHiBar,   bar_index)
+            array.push(pendHiStars, sweptHiStars)
+            // remove this pool (and any others in same cluster — consolidates multi-pool sweeps)
+            ln = array.get(poolHiLine, i)
+            if not na(ln)
+                line.delete(ln)
+            array.remove(poolHiPrice, i)
+            array.remove(poolHiBar, i)
+            array.remove(poolHiLine, i)
+            array.remove(poolHiArmed, i)
+            array.remove(poolHiCluster, i)
+            // sweep also clears nearby clustered pools
+            j = array.size(poolHiPrice) - 1
+            while j >= 0
+                if math.abs(array.get(poolHiPrice, j) - p) <= eqTol and high >= array.get(poolHiPrice, j)
+                    ln2 = array.get(poolHiLine, j)
+                    if not na(ln2)
+                        line.delete(ln2)
+                    array.remove(poolHiPrice, j)
+                    array.remove(poolHiBar, j)
+                    array.remove(poolHiLine, j)
+                    array.remove(poolHiArmed, j)
+                    array.remove(poolHiCluster, j)
+                j -= 1
+            recomputeClustersHi()
+            break  // one sweep per side per bar
+        i -= 1
+
+if barstate.isconfirmed and not muteLows and array.size(poolLoPrice) > 0
+    i = array.size(poolLoPrice) - 1
+    while i >= 0
+        p       = array.get(poolLoPrice, i)
+        bar     = array.get(poolLoBar,   i)
+        armed   = array.get(poolLoArmed, i)
+        cluster = array.get(poolLoCluster, i)
+        age     = bar_index - bar
+        depth   = (p - low)
+        reclaim = (close - p)
+        depthAtr = atr14 > 0 ? depth / atr14 : 0
+        volRatio = volAvg > 0 ? volume / volAvg : 0
+        volPass  = not useVolFilter or volRatio >= volMult
+
+        if armed and age >= minPoolAge and depth >= minSweepDepthAtr * atr14 and reclaim >= minReclaimDepthAtr * atr14 and volPass
+            sweptLo := true
+            sweptLoPrice := p
+            sweptLoCluster := cluster
+            sweptLoStars := calcStars(cluster, depthAtr, volRatio, isChop)
+            array.push(pendLoPrice, p)
+            array.push(pendLoBar,   bar_index)
+            array.push(pendLoStars, sweptLoStars)
+            ln = array.get(poolLoLine, i)
+            if not na(ln)
+                line.delete(ln)
+            array.remove(poolLoPrice, i)
+            array.remove(poolLoBar, i)
+            array.remove(poolLoLine, i)
+            array.remove(poolLoArmed, i)
+            array.remove(poolLoCluster, i)
+            j = array.size(poolLoPrice) - 1
+            while j >= 0
+                if math.abs(array.get(poolLoPrice, j) - p) <= eqTol and low <= array.get(poolLoPrice, j)
+                    ln2 = array.get(poolLoLine, j)
+                    if not na(ln2)
+                        line.delete(ln2)
+                    array.remove(poolLoPrice, j)
+                    array.remove(poolLoBar, j)
+                    array.remove(poolLoLine, j)
+                    array.remove(poolLoArmed, j)
+                    array.remove(poolLoCluster, j)
+                j -= 1
+            recomputeClustersLo()
+            break
+        i -= 1
+
+// ═════════════════════════════════════════════════════════════
+// stale pool consumption — if price closes firmly through a pool
+// without a sweep+reclaim, the pool is "consumed via continuation"
+// not swept. clean it up so the chart doesn't lie.
+// ═════════════════════════════════════════════════════════════
+if barstate.isconfirmed and array.size(poolHiPrice) > 0
+    i = array.size(poolHiPrice) - 1
+    while i >= 0
+        p = array.get(poolHiPrice, i)
+        // close above pool by > 0.5 ATR = consumed
+        if close > p + 0.5 * atr14
+            ln = array.get(poolHiLine, i)
+            if not na(ln)
+                line.delete(ln)
+            array.remove(poolHiPrice, i)
+            array.remove(poolHiBar, i)
+            array.remove(poolHiLine, i)
+            array.remove(poolHiArmed, i)
+            array.remove(poolHiCluster, i)
+        i -= 1
+
+if barstate.isconfirmed and array.size(poolLoPrice) > 0
+    i = array.size(poolLoPrice) - 1
+    while i >= 0
+        p = array.get(poolLoPrice, i)
+        if close < p - 0.5 * atr14
+            ln = array.get(poolLoLine, i)
+            if not na(ln)
+                line.delete(ln)
+            array.remove(poolLoPrice, i)
+            array.remove(poolLoBar, i)
+            array.remove(poolLoLine, i)
+            array.remove(poolLoArmed, i)
+            array.remove(poolLoCluster, i)
+        i -= 1
+
+// ═════════════════════════════════════════════════════════════
+// prune by age + cap by maxPools
+// ═════════════════════════════════════════════════════════════
+prunePools(prices, bars, lines, armed, clusters) =>
+    n = array.size(prices)
+    if n > 0
+        i = n - 1
+        while i >= 0
+            if bar_index - array.get(bars, i) > maxPoolAge
+                ln = array.get(lines, i)
+                if not na(ln)
+                    line.delete(ln)
+                array.remove(prices, i)
+                array.remove(bars, i)
+                array.remove(lines, i)
+                array.remove(armed, i)
+                array.remove(clusters, i)
+            i -= 1
+        // cap: drop oldest until under limit
+        while array.size(prices) > maxPools
+            ln = array.get(lines, 0)
+            if not na(ln)
+                line.delete(ln)
+            array.remove(prices, 0)
+            array.remove(bars, 0)
+            array.remove(lines, 0)
+            array.remove(armed, 0)
+            array.remove(clusters, 0)
+
+prunePools(poolHiPrice, poolHiBar, poolHiLine, poolHiArmed, poolHiCluster)
+prunePools(poolLoPrice, poolLoBar, poolLoLine, poolLoArmed, poolLoCluster)
+
+// ═════════════════════════════════════════════════════════════
+// reclaim entry signal
+// after a sweep is queued, watch next reclaimWindow bars for a
+// momentum bar that closes back through pool with range > threshold
+// ═════════════════════════════════════════════════════════════
+reclaimShort = false
+reclaimLong  = false
+reclaimShortStars = 0
+reclaimLongStars  = 0
+
+if showReclaim and barstate.isconfirmed
+    // SHORT setup: sweep HI was queued, look for momentum bear bar closing below pool
+    if array.size(pendHiPrice) > 0
+        i = array.size(pendHiPrice) - 1
+        while i >= 0
+            sweepBar  = array.get(pendHiBar, i)
+            poolP     = array.get(pendHiPrice, i)
+            stars     = array.get(pendHiStars, i)
+            barsAfter = bar_index - sweepBar
+            barRange  = high - low
+            isMomBear = close < open and barRange >= reclaimMomAtrMult * atr14 and close < poolP
+            if barsAfter > 0 and barsAfter <= reclaimWindow and isMomBear and not muteHighs
+                reclaimShort := true
+                reclaimShortStars := stars
+                array.remove(pendHiPrice, i)
+                array.remove(pendHiBar, i)
+                array.remove(pendHiStars, i)
+            else if barsAfter > reclaimWindow
+                array.remove(pendHiPrice, i)
+                array.remove(pendHiBar, i)
+                array.remove(pendHiStars, i)
+            i -= 1
+
+    if array.size(pendLoPrice) > 0
+        i = array.size(pendLoPrice) - 1
+        while i >= 0
+            sweepBar  = array.get(pendLoBar, i)
+            poolP     = array.get(pendLoPrice, i)
+            stars     = array.get(pendLoStars, i)
+            barsAfter = bar_index - sweepBar
+            barRange  = high - low
+            isMomBull = close > open and barRange >= reclaimMomAtrMult * atr14 and close > poolP
+            if barsAfter > 0 and barsAfter <= reclaimWindow and isMomBull and not muteLows
+                reclaimLong := true
+                reclaimLongStars := stars
+                array.remove(pendLoPrice, i)
+                array.remove(pendLoBar, i)
+                array.remove(pendLoStars, i)
+            else if barsAfter > reclaimWindow
+                array.remove(pendLoPrice, i)
+                array.remove(pendLoBar, i)
+                array.remove(pendLoStars, i)
+            i -= 1
+
+// ═════════════════════════════════════════════════════════════
+// labels — chop regime grays them out instead of suppressing
+// (operator still sees what fired, just with reduced weight)
+// ═════════════════════════════════════════════════════════════
+starStr(s) => s >= 3 ? "★★★" : s == 2 ? "★★" : "★"
+
+makeColor(base, chop) => chop ? color.new(color.gray, 30) : base
+
+if sweptHi and showSweepLbl
+    txt = "SWEEP HI " + starStr(sweptHiStars)
+    label.new(bar_index, high + 0.3 * atr14, txt,
+         style = label.style_label_down,
+         color = makeColor(colSweepHi, isChop),
+         textcolor = color.white,
+         size = lblSizeVal)
+
+if sweptLo and showSweepLbl
+    txt = "SWEEP LO " + starStr(sweptLoStars)
+    label.new(bar_index, low - 0.3 * atr14, txt,
+         style = label.style_label_up,
+         color = makeColor(colSweepLo, isChop),
+         textcolor = color.white,
+         size = lblSizeVal)
+
+if reclaimShort and showReclaim
+    label.new(bar_index, high + 0.6 * atr14, "↓ SHORT " + starStr(reclaimShortStars),
+         style = label.style_label_down,
+         color = makeColor(colReclaimHi, isChop),
+         textcolor = color.black,
+         size = lblSizeVal)
+
+if reclaimLong and showReclaim
+    label.new(bar_index, low - 0.6 * atr14, "↑ LONG " + starStr(reclaimLongStars),
+         style = label.style_label_up,
+         color = makeColor(colReclaimLo, isChop),
+         textcolor = color.black,
+         size = lblSizeVal)
+
+// ═════════════════════════════════════════════════════════════
+// status dashboard — top right table
+// graze-and-go: tells him state in 2 seconds
+// ═════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 6, border_width = 1)
+
+if showDashboard and barstate.islast
+    // nearest armed pool above
+    float nearestHi = na
+    int   nearestHiCluster = 0
+    if array.size(poolHiPrice) > 0
+        for i = 0 to array.size(poolHiPrice) - 1
+            p = array.get(poolHiPrice, i)
+            if array.get(poolHiArmed, i) and p > close
+                if na(nearestHi) or p < nearestHi
+                    nearestHi := p
+                    nearestHiCluster := array.get(poolHiCluster, i)
+    float nearestLo = na
+    int   nearestLoCluster = 0
+    if array.size(poolLoPrice) > 0
+        for i = 0 to array.size(poolLoPrice) - 1
+            p = array.get(poolLoPrice, i)
+            if array.get(poolLoArmed, i) and p < close
+                if na(nearestLo) or p > nearestLo
+                    nearestLo := p
+                    nearestLoCluster := array.get(poolLoCluster, i)
+
+    distHi = na(nearestHi) ? "—" : str.tostring(nearestHi, format.mintick) + "  (" + str.tostring((nearestHi - close) / atr14, "#.##") + " ATR)"
+    distLo = na(nearestLo) ? "—" : str.tostring(nearestLo, format.mintick) + "  (" + str.tostring((close - nearestLo) / atr14, "#.##") + " ATR)"
+    clHiStr = na(nearestHi) ? "" : "  ×" + str.tostring(nearestHiCluster)
+    clLoStr = na(nearestLo) ? "" : "  ×" + str.tostring(nearestLoCluster)
+
+    table.cell(dash, 0, 0, "MALLOY · sweep v2", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker, text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+
+    table.cell(dash, 0, 1, "regime", text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.small)
+    table.cell(dash, 1, 1, regimeStr, text_color = color.white, bgcolor = regimeColor, text_size = size.small)
+
+    table.cell(dash, 0, 2, "ATR(14)", text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(atr14, format.mintick), text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.small)
+
+    table.cell(dash, 0, 3, "↑ pool above", text_color = color.white, bgcolor = color.new(color.red, 60), text_size = size.small)
+    table.cell(dash, 1, 3, distHi + clHiStr, text_color = color.white, bgcolor = color.new(color.red, 60), text_size = size.small)
+
+    table.cell(dash, 0, 4, "↓ pool below", text_color = color.white, bgcolor = color.new(color.lime, 60), text_size = size.small)
+    table.cell(dash, 1, 4, distLo + clLoStr, text_color = color.white, bgcolor = color.new(color.lime, 60), text_size = size.small)
+
+    armedHi = 0
+    armedLo = 0
+    if array.size(poolHiArmed) > 0
+        for i = 0 to array.size(poolHiArmed) - 1
+            if array.get(poolHiArmed, i)
+                armedHi += 1
+    if array.size(poolLoArmed) > 0
+        for i = 0 to array.size(poolLoArmed) - 1
+            if array.get(poolLoArmed, i)
+                armedLo += 1
+    table.cell(dash, 0, 5, "armed pools", text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(armedHi) + " ↑   " + str.tostring(armedLo) + " ↓", text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.small)
+
+// ═════════════════════════════════════════════════════════════
+// alerts — quality-gated, regime-gated
+// ═════════════════════════════════════════════════════════════
+chopMute(stars) => alertSuppressChop and isChop and stars < 3  // 3-star signals fire even in chop
+
+if sweptHi and alertSweepHi and sweptHiStars >= minStarsForAlert and not chopMute(sweptHiStars)
+    alert("malloy SWEEP HI " + starStr(sweptHiStars) + " · " + syminfo.ticker +
+          " @ " + str.tostring(sweptHiPrice, format.mintick) +
+          " · cluster ×" + str.tostring(sweptHiCluster) +
+          " · regime " + regimeStr, alert.freq_once_per_bar_close)
+
+if sweptLo and alertSweepLo and sweptLoStars >= minStarsForAlert and not chopMute(sweptLoStars)
+    alert("malloy SWEEP LO " + starStr(sweptLoStars) + " · " + syminfo.ticker +
+          " @ " + str.tostring(sweptLoPrice, format.mintick) +
+          " · cluster ×" + str.tostring(sweptLoCluster) +
+          " · regime " + regimeStr, alert.freq_once_per_bar_close)
+
+if reclaimShort and alertReclaimHi and reclaimShortStars >= minStarsForAlert and not chopMute(reclaimShortStars)
+    alert("malloy RECLAIM SHORT " + starStr(reclaimShortStars) + " · " + syminfo.ticker +
+          " @ " + str.tostring(close, format.mintick) +
+          " · regime " + regimeStr, alert.freq_once_per_bar_close)
+
+if reclaimLong and alertReclaimLo and reclaimLongStars >= minStarsForAlert and not chopMute(reclaimLongStars)
+    alert("malloy RECLAIM LONG " + starStr(reclaimLongStars) + " · " + syminfo.ticker +
+          " @ " + str.tostring(close, format.mintick) +
+          " · regime " + regimeStr, alert.freq_once_per_bar_close)
+
+// alertcondition fallback for users who prefer TV's native dialog
+alertcondition(sweptHi,      title = "Sweep High",     message = "malloy: sweep HIGH on {{ticker}} @ {{close}}")
+alertcondition(sweptLo,      title = "Sweep Low",      message = "malloy: sweep LOW on {{ticker}} @ {{close}}")
+alertcondition(reclaimShort, title = "Reclaim Short",  message = "malloy: reclaim SHORT on {{ticker}} @ {{close}}")
+alertcondition(reclaimLong,  title = "Reclaim Long",   message = "malloy: reclaim LONG on {{ticker}} @ {{close}}")
+
+// ═════════════════════════════════════════════════════════════
+// changelog
+// v1   — pivot pools, equal-H/L cluster filter, sweep on close, basic alerts
+// v2.0 — major rebuild:
+//        · armed/cold pool distinction (visual + behavioral)
+//        · min cluster size param (2-tap, 3-tap)
+//        · sweep depth + reclaim depth ATR-relative filters
+//        · volume confirmation
+//        · stale pool consumption logic (no chart-lying)
+//        · ATR-percentile regime detector (CHOP / ACTIVE) — enforces "skip chop"
+//        · separate RECLAIM entry signal (sweep + N-bar momentum reclaim)
+//        · 1–3 star quality scoring on every signal
+//        · status dashboard (regime, nearest pools, distance in ATR, armed counts)
+//        · per-side mute, quality-gated alerts, chop-suppressed alerts
+//        · maxPools cap, smart label offsetting, richer alert payloads
+// the operator is the variable
